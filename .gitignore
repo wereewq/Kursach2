@@ -1,0 +1,27 @@
+# Python & виртуальное окружение
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Node.js / React / Vite
+node_modules/
+dist/
+build/
+.vite/
+
+# Переменные окружения и секреты
+.env
+*.env.local
+
+# Загруженные файлы пользователей (сохраняем только саму папку)
+service-desk/backend/uploads/*
+!service-desk/backend/uploads/.gitkeep
+
+# IDE и системные файлы
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
