@@ -25,3 +25,10 @@ service-desk/backend/uploads/*
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Бэкапы, логи воркера и ключ шифрования
+service-desk/backend/backups/*
+!service-desk/backend/backups/.gitkeep
+service-desk/backend/logs/*
+!service-desk/backend/logs/.gitkeep
+service-desk/backend/.fernet.key

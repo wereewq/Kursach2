@@ -1,3 +1,5 @@
+from app.core.crypto import encrypt_text, decrypt_text
+from app.core.db_objects import log_audit
 import random
 from fastapi import APIRouter, Depends, Body, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
@@ -46,6 +48,7 @@ def register_client(data: UserBase, password: str, db: Session = Depends(get_db)
 
 @router.get("/me", response_model=UserOut)
 def get_me(current_user: User = Depends(get_current_user)):
+    current_user.phone = decrypt_text(current_user.phone)
     return current_user
 
 @router.post("/change-password")
@@ -64,9 +67,10 @@ def update_me(
     db: Session = Depends(get_db)
 ):
     current_user.full_name = full_name
-    current_user.phone = phone
+    current_user.phone = encrypt_text(phone)
     db.commit()
     db.refresh(current_user)
+    current_user.phone = decrypt_text(current_user.phone)
     return current_user
 
 RESET_CODES: dict[str, str] = {}

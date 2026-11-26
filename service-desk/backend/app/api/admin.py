@@ -1,167 +1,328 @@
-from datetime import datetime, timezone
-from typing import List
-import csv
+import os
 import io
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
-from sqlalchemy import func
+import csv
+import subprocess
+from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi.responses import StreamingResponse, PlainTextResponse
 from sqlalchemy.orm import Session
-from app.core.database import get_db
+from sqlalchemy import text
+from app.core.database import get_db, engine
 from app.core.security import get_password_hash
-from app.models.models import (
-    User, Role, Category, SLAPolicy, Ticket, TicketStatus, TicketRating
-)
-from app.schemas.schemas import (
-    UserCreate, UserUpdate, UserOut, RoleOut, CategoryCreate,
-    CategoryOut, SLAPolicyUpdate, SLAPolicyOut
-)
-from app.api.deps import require_roles, get_current_user
+from app.api.deps import require_roles as require_roles
+from app.core.crypto import encrypt_text, decrypt_text
+from app.core.db_objects import log_audit
+from app.models.models import User, Role, SLAPolicy, Category, KnowledgeBase
 
-router = APIRouter(prefix="/api/admin", tags=["Администрирование и Аналитика"])
+router = APIRouter(prefix="/api/admin", tags=["Admin & Reports"])
+BACKUP_DIR = "backups"
+os.makedirs(BACKUP_DIR, exist_ok=True)
 
-# Список специалистов для назначения диспетчером
-@router.get("/specialists", response_model=List[UserOut])
-def get_specialists(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    spec_role = db.query(Role).filter(Role.role_name == "specialist").first()
-    return db.query(User).filter(User.role_id == spec_role.role_id, User.is_active == True).all()
 
-# Пользователи и роли
-@router.get("/roles", response_model=List[RoleOut])
-def get_roles(db: Session = Depends(get_db), _: User = Depends(require_roles(["admin"]))):
-    return db.query(Role).all()
+@router.get("/specialists")
+def list_specialists(db: Session = Depends(get_db)):
+    specs = (
+        db.query(User)
+        .join(Role)
+        .filter(Role.role_name == "specialist", User.is_active == True)
+        .all()
+    )
+    return [{"user_id": s.user_id, "full_name": s.full_name, "email": s.email} for s in specs]
 
-@router.get("/users", response_model=List[UserOut])
+
+@router.get("/analytics")
+def get_analytics(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles(["admin", "dispatcher"])),
+):
+    # Используем SQL VIEW v_tickets_overview и хранимую функцию fn_calculate_sla_compliance()
+    total = db.execute(text("SELECT COUNT(*) FROM v_tickets_overview")).scalar() or 0
+    overdue = db.execute(text("SELECT COUNT(*) FROM v_tickets_overview WHERE is_overdue = TRUE")).scalar() or 0
+    sla_compliance = float(db.execute(text("SELECT fn_calculate_sla_compliance()")).scalar() or 100.0)
+    avg_rating = db.execute(text("SELECT ROUND(COALESCE(AVG(score), 0)::numeric, 2) FROM ticket_ratings")).scalar() or 0
+
+    by_status_rows = db.execute(
+        text("SELECT status_name, COUNT(*) AS cnt FROM v_tickets_overview GROUP BY status_name ORDER BY cnt DESC")
+    ).fetchall()
+    by_category_rows = db.execute(
+        text("SELECT category_name, COUNT(*) AS cnt FROM v_tickets_overview GROUP BY category_name ORDER BY cnt DESC")
+    ).fetchall()
+    kpi_rows = db.execute(
+        text("SELECT specialist_name, total_assigned, resolved_count, avg_rating FROM v_specialist_kpi ORDER BY total_assigned DESC")
+    ).fetchall()
+
+    return {
+        "total_tickets": total,
+        "overdue_sla_count": overdue,
+        "sla_compliance_percent": sla_compliance,
+        "average_rating": float(avg_rating),
+        "by_status": [{"status": r[0], "count": r[1]} for r in by_status_rows],
+        "by_category": [{"category": r[0], "count": r[1]} for r in by_category_rows],
+        "specialist_kpi": [
+            {"name": r[0], "assigned": r[1], "resolved": r[2], "rating": float(r[3])}
+            for r in kpi_rows
+        ],
+    }
+
+
+@router.get("/users")
 def list_users(db: Session = Depends(get_db), _: User = Depends(require_roles(["admin"]))):
-    return db.query(User).order_by(User.user_id).all()
+    users = db.query(User).order_by(User.user_id).all()
+    res = []
+    for u in users:
+        res.append({
+            "user_id": u.user_id,
+            "email": u.email,
+            "full_name": u.full_name,
+            "phone": decrypt_text(u.phone),
+            "role_id": u.role_id,
+            "is_active": u.is_active,
+        })
+    return res
 
-@router.post("/users", response_model=UserOut)
-def create_user(data: UserCreate, db: Session = Depends(get_db), _: User = Depends(require_roles(["admin"]))):
-    if db.query(User).filter(User.email == data.email).first():
-        raise HTTPException(status_code=400, detail="Email уже существует")
+
+@router.post("/users")
+def create_user(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(["admin"])),
+):
+    if db.query(User).filter(User.email == payload["email"]).first():
+        raise HTTPException(status_code=400, detail="Пользователь с таким Email уже существует")
     user = User(
-        role_id=data.role_id,
-        email=data.email,
-        full_name=data.full_name,
-        phone=data.phone,
-        password_hash=get_password_hash(data.password)
+        email=payload["email"],
+        full_name=payload["full_name"],
+        phone=encrypt_text(payload.get("phone")),
+        password_hash=get_password_hash(payload.get("password", "123456")),
+        role_id=int(payload["role_id"]),
+        is_active=True,
     )
     db.add(user)
     db.commit()
-    db.refresh(user)
-    return user
+    log_audit(current_user.email, "CREATE_USER", f"Создан пользователь {user.email}")
+    return {"status": "ok", "user_id": user.user_id}
 
-@router.patch("/users/{user_id}", response_model=UserOut)
-def update_user(user_id: int, data: UserUpdate, db: Session = Depends(get_db), _: User = Depends(require_roles(["admin"]))):
+
+@router.patch("/users/{user_id}")
+def update_user(
+    user_id: int,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(["admin"])),
+):
     user = db.query(User).filter(User.user_id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
-    for field, value in data.model_dump(exclude_unset=True).items():
-        setattr(user, field, value)
+    if "full_name" in payload:
+        user.full_name = payload["full_name"]
+    if "phone" in payload:
+        user.phone = encrypt_text(payload["phone"])
+    if "role_id" in payload:
+        user.role_id = int(payload["role_id"])
+    if "is_active" in payload:
+        user.is_active = bool(payload["is_active"])
     db.commit()
-    db.refresh(user)
-    return user
+    log_audit(current_user.email, "UPDATE_USER", f"Обновлен пользователь ID={user_id}")
+    return {"status": "ok"}
 
-# Категории
-@router.post("/categories", response_model=CategoryOut)
-def create_category(data: CategoryCreate, db: Session = Depends(get_db), _: User = Depends(require_roles(["admin"]))):
-    cat = Category(**data.model_dump())
-    db.add(cat)
-    db.commit()
-    db.refresh(cat)
-    return cat
-
-# Настройка SLA
-@router.get("/sla", response_model=List[SLAPolicyOut])
-def list_sla(db: Session = Depends(get_db), _: User = Depends(require_roles(["admin", "dispatcher"]))):
-    return db.query(SLAPolicy).all()
-
-@router.put("/sla/{sla_id}", response_model=SLAPolicyOut)
-def update_sla(sla_id: int, data: SLAPolicyUpdate, db: Session = Depends(get_db), _: User = Depends(require_roles(["admin"]))):
-    sla = db.query(SLAPolicy).filter(SLAPolicy.sla_id == sla_id).first()
-    if not sla:
-        raise HTTPException(status_code=404, detail="Регламент SLA не найден")
-    sla.response_time_minutes = data.response_time_minutes
-    sla.resolve_time_hours = data.resolve_time_hours
-    db.commit()
-    db.refresh(sla)
-    return sla
-
-# Аналитическая отчетность и статистика SLA
-@router.get("/analytics")
-def get_analytics(db: Session = Depends(get_db), _: User = Depends(require_roles(["admin", "dispatcher"]))):
-    total_tickets = db.query(Ticket).count()
-    now = datetime.now(timezone.utc)
-
-    # Распределение по статусам
-    by_status = (
-        db.query(TicketStatus.status_name, func.count(Ticket.ticket_id))
-        .outerjoin(Ticket, Ticket.status_id == TicketStatus.status_id)
-        .group_by(TicketStatus.status_name)
-        .all()
-    )
-
-    # Нарушения SLA (закрыты позже дедлайна или не закрыты и дедлайн прошел)
-    overdue_tickets = db.query(Ticket).filter(
-        Ticket.sla_deadline.isnot(None),
-        ((Ticket.closed_at.isnot(None)) & (Ticket.closed_at > Ticket.sla_deadline)) |
-        ((Ticket.closed_at.is_(None)) & (Ticket.sla_deadline < now))
-    ).count()
-
-    avg_rating = db.query(func.avg(TicketRating.score)).scalar()
-
-    return {
-        "total_tickets": total_tickets,
-        "overdue_sla_count": overdue_tickets,
-        "average_rating": round(float(avg_rating), 2) if avg_rating else 0.0,
-        "by_status": [{"status": s, "count": c} for s, c in by_status]
-    }
-
-@router.get("/export-report")
-def export_report(db: Session = Depends(get_db), _: User = Depends(require_roles(["admin", "dispatcher"]))):
-    tickets = db.query(Ticket).order_by(Ticket.ticket_id.desc()).all()
-    now = datetime.now(timezone.utc)
-
-    output = io.StringIO()
-    output.write("\ufeff")  # BOM для корректного открытия кириллицы в Excel
-    writer = csv.writer(output, delimiter=";")
-    writer.writerow([
-        "№ заявки", "Тема", "Категория", "Приоритет", "Статус",
-        "Заявитель", "Исполнитель", "Дата создания", "Дедлайн SLA",
-        "Дата закрытия", "Статус SLA", "Оценка (1-5)"
-    ])
-
-    for t in tickets:
-        sla_status = "Без SLA"
-        if t.sla_deadline:
-            if t.closed_at:
-                sla_status = "Нарушен" if t.closed_at > t.sla_deadline else "Выполнен в срок"
-            else:
-                sla_status = "Просрочен" if now > t.sla_deadline else "В пределах нормы"
-
-        writer.writerow([
-            t.ticket_id,
-            t.title,
-            t.category.category_name if t.category else "",
-            t.priority.priority_name if t.priority else "",
-            t.status.status_name if t.status else "",
-            t.client.full_name if t.client else "",
-            t.specialist.full_name if t.specialist else "Не назначен",
-            t.created_at.strftime("%Y-%m-%d %H:%M") if t.created_at else "",
-            t.sla_deadline.strftime("%Y-%m-%d %H:%M") if t.sla_deadline else "",
-            t.closed_at.strftime("%Y-%m-%d %H:%M") if t.closed_at else "",
-            sla_status,
-            t.rating.score if t.rating else ""
-        ])
-
-    output.seek(0)
-    headers = {"Content-Disposition": "attachment; filename=servicedesk_sla_report.csv"}
-    return StreamingResponse(iter([output.getvalue()]), media_type="text/csv; charset=utf-8", headers=headers)
 
 @router.post("/users/{user_id}/reset-password")
-def admin_reset_password(user_id: int, db: Session = Depends(get_db), _: User = Depends(require_roles(["admin"]))):
+def admin_reset_password(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(["admin"])),
+):
     user = db.query(User).filter(User.user_id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
     user.password_hash = get_password_hash("123456")
     db.commit()
+    log_audit(current_user.email, "RESET_PASSWORD", f"Сброшен пароль пользователю {user.email}")
     return {"status": "ok"}
+
+
+@router.get("/roles")
+def list_roles(db: Session = Depends(get_db), _: User = Depends(require_roles(["admin"]))):
+    return db.query(Role).all()
+
+
+@router.get("/sla")
+def list_sla(db: Session = Depends(get_db), _: User = Depends(require_roles(["admin"]))):
+    return db.query(SLAPolicy).order_by(SLAPolicy.sla_id).all()
+
+
+@router.put("/sla/{sla_id}")
+def update_sla(
+    sla_id: int,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(["admin"])),
+):
+    sla = db.query(SLAPolicy).filter(SLAPolicy.sla_id == sla_id).first()
+    if not sla:
+        raise HTTPException(status_code=404, detail="Регламент SLA не найден")
+    sla.response_time_minutes = int(payload["response_time_minutes"])
+    sla.resolve_time_hours = int(payload["resolve_time_hours"])
+    db.commit()
+    log_audit(current_user.email, "UPDATE_SLA", f"Изменен SLA ID={sla_id}")
+    return {"status": "ok"}
+
+
+# --- ЭКСПОРТ И ИМПОРТ В ФОРМАТАХ CSV И SQL ---
+
+@router.get("/export-report")
+def export_csv_report(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(["admin", "dispatcher"])),
+):
+    rows = db.execute(text("SELECT * FROM v_tickets_overview ORDER BY ticket_id")).fetchall()
+    buf = io.StringIO()
+    buf.write("\ufeff")
+    writer = csv.writer(buf, delimiter=";")
+    writer.writerow(["ID", "Тема", "Категория", "Приоритет", "Статус", "Заявитель", "Исполнитель", "Создана", "Дедлайн SLA", "Просрочена"])
+    for r in rows:
+        writer.writerow([
+            r.ticket_id, r.title, r.category_name, r.priority_name,
+            r.status_name, r.client_name, r.specialist_name,
+            str(r.created_at), str(r.sla_deadline or ""), "Да" if r.is_overdue else "Нет"
+        ])
+    log_audit(current_user.email, "EXPORT_CSV", "Выгружен отчет по заявкам в CSV")
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=fastsup_tickets_report.csv"},
+    )
+
+
+@router.get("/export-kb-csv")
+def export_kb_csv(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(["admin"])),
+):
+    articles = db.query(KnowledgeBase).all()
+    buf = io.StringIO()
+    buf.write("\ufeff")
+    writer = csv.writer(buf, delimiter=";")
+    writer.writerow(["category_id", "title", "solution_text"])
+    for a in articles:
+        writer.writerow([a.category_id, a.title, a.solution_text])
+    log_audit(current_user.email, "EXPORT_KB_CSV", "Экспорт Базы Знаний в CSV")
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=fastsup_kb.csv"},
+    )
+
+
+@router.post("/import-kb-csv")
+def import_kb_csv(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(["admin"])),
+):
+    raw = file.file.read().decode("utf-8-sig")
+    dialect_delim = ";" if ";" in raw.splitlines()[0] else ","
+    reader = csv.DictReader(io.StringIO(raw), delimiter=dialect_delim)
+    default_cat = db.query(Category).first()
+    added = 0
+    for row in reader:
+        title = (row.get("title") or "").strip()
+        sol = (row.get("solution_text") or "").strip()
+        if not title or not sol:
+            continue
+        if not db.query(KnowledgeBase).filter(KnowledgeBase.title == title).first():
+            cat_id = int(row["category_id"]) if str(row.get("category_id", "")).isdigit() else default_cat.category_id
+            db.add(KnowledgeBase(
+                category_id=cat_id,
+                author_id=current_user.user_id,
+                title=title,
+                solution_text=sol,
+            ))
+            added += 1
+    db.commit()
+    log_audit(current_user.email, "IMPORT_KB_CSV", f"Импортировано статей БЗ из CSV: {added}")
+    return {"status": "ok", "imported_count": added}
+
+
+def _generate_sql_dump() -> str:
+    lines = [
+        f"-- FastSup PostgreSQL Dump ({datetime.now().isoformat()})",
+        "BEGIN;",
+    ]
+    tables = ["roles", "users", "categories", "priorities", "ticket_statuses", "sla_policies", "knowledge_base", "tickets", "ticket_messages", "ticket_ratings"]
+    with engine.connect() as conn:
+        for tbl in tables:
+            res = conn.execute(text(f"SELECT * FROM {tbl}"))
+            cols = list(res.keys())
+            for row in res.fetchall():
+                vals = []
+                for v in row:
+                    if v is None:
+                        vals.append("NULL")
+                    elif isinstance(v, bool):
+                        vals.append("TRUE" if v else "FALSE")
+                    elif isinstance(v, (int, float)):
+                        vals.append(str(v))
+                    else:
+                        escaped = str(v).replace("'", "''")
+                        vals.append(f"'{escaped}'")
+                lines.append(f"INSERT INTO {tbl} ({', '.join(cols)}) VALUES ({', '.join(vals)}) ON CONFLICT DO NOTHING;")
+    lines.append("COMMIT;")
+    return "\n".join(lines)
+
+
+@router.get("/export-sql")
+def export_sql_dump(current_user: User = Depends(require_roles(["admin"]))):
+    sql_text = _generate_sql_dump()
+    log_audit(current_user.email, "EXPORT_SQL", "Выгружен SQL-дамп базы данных")
+    return PlainTextResponse(
+        content=sql_text,
+        media_type="application/sql; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=fastsup_backup.sql"},
+    )
+
+
+@router.post("/import-sql")
+def import_sql_dump(
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_roles(["admin"])),
+):
+    sql_script = file.file.read().decode("utf-8-sig")
+    with engine.begin() as conn:
+        conn.execute(text(sql_script))
+    log_audit(current_user.email, "IMPORT_SQL", f"Выполнен импорт SQL-скрипта ({file.filename})")
+    return {"status": "ok"}
+
+
+# --- ЖУРНАЛ АУДИТА И РЕЗЕРВНЫЕ КОПИИ ---
+
+@router.get("/audit-logs")
+def get_audit_logs(db: Session = Depends(get_db), _: User = Depends(require_roles(["admin"]))):
+    rows = db.execute(
+        text("SELECT log_id, user_email, action, details, created_at FROM audit_logs ORDER BY log_id DESC LIMIT 30")
+    ).fetchall()
+    return [
+        {"log_id": r[0], "user_email": r[1], "action": r[2], "details": r[3], "created_at": str(r[4])}
+        for r in rows
+    ]
+
+
+@router.get("/backups")
+def list_backups(_: User = Depends(require_roles(["admin"]))):
+    files = sorted(os.listdir(BACKUP_DIR), reverse=True)
+    result = []
+    for f in files:
+        if f.endswith(".sql"):
+            full = os.path.join(BACKUP_DIR, f)
+            result.append({"filename": f, "size_kb": round(os.path.getsize(full) / 1024, 2)})
+    return result
+
+
+@router.post("/backups/create")
+def create_backup_now(current_user: User = Depends(require_roles(["admin"]))):
+    fname = f"fastsup_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sql"
+    fpath = os.path.join(BACKUP_DIR, fname)
+    with open(fpath, "w", encoding="utf-8") as f:
+        f.write(_generate_sql_dump())
+    log_audit(current_user.email, "MANUAL_BACKUP", f"Создана резервная копия {fname}")
+    return {"status": "ok", "filename": fname}

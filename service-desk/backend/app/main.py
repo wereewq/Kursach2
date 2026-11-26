@@ -1,3 +1,4 @@
+from app.core.db_objects import init_db_objects
 import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,3 +34,5 @@ app.include_router(admin.router)
 @app.get("/")
 def root():
     return {"status": "ok", "docs": "/docs"}
+
+init_db_objects()

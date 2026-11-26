@@ -4,6 +4,7 @@ import type {
   RoleName, Ticket, Category, Priority, Status, User, KBArticle, SLAPolicy, Role
 } from './types';
 import { TicketModal } from './TicketModal';
+import { AdminExtras } from './AdminExtras';
 import {
   Zap, Plus, Search, BookOpen, BarChart3, Users, Sliders,
   LogOut, Trash2, Edit2, User as UserIcon, X, Lock, Unlock, Download, ClipboardList,
@@ -812,8 +813,8 @@ export function App() {
                 <div style={{ fontSize: 28, fontWeight: 700, marginTop: 4 }}>{analytics.total_tickets}</div>
               </div>
               <div className="card">
-                <div style={{ fontSize: 13, color: 'var(--muted)' }}>Нарушения SLA</div>
-                <div style={{ fontSize: 28, fontWeight: 700, marginTop: 4, color: 'var(--danger)' }}>{analytics.overdue_sla_count}</div>
+                <div style={{ fontSize: 13, color: 'var(--muted)' }}>Нарушения / Соблюдение SLA</div>
+                <div style={{ fontSize: 24, fontWeight: 700, marginTop: 4, color: 'var(--danger)' }}>{analytics.overdue_sla_count} <span style={{ fontSize: 15, color: 'var(--success)' }}>({analytics.sla_compliance_percent ?? 100}%)</span></div>
               </div>
               <div className="card">
                 <div style={{ fontSize: 13, color: 'var(--muted)' }}>Средняя оценка качества</div>
@@ -828,6 +829,13 @@ export function App() {
                 </div>
               </div>
             </div>
+
+            <AdminExtras
+              analytics={analytics}
+              isAdmin={role === 'admin'}
+              notify={notify}
+              onRefreshAll={() => { loadTickets(); loadBaseData(); loadAdminData(); }}
+            />
 
             {role === 'admin' && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
